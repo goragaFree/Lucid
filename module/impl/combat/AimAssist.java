@@ -1,13 +1,11 @@
 package dev.lucid.module.impl.combat;
 
-import dev.lucid.event.Priority;
-import dev.lucid.event.Subscribe;
-import dev.lucid.event.impl.ClientTickEvent;
 import dev.lucid.module.Category;
 import dev.lucid.module.Module;
 import dev.lucid.setting.MultiSelectSetting;
 import dev.lucid.setting.SelectSetting;
 import dev.lucid.setting.SliderSetting;
+import dev.lucid.util.math.MathUtil;
 import dev.lucid.util.players.friend.FriendManager;
 import dev.lucid.util.render.Render2D;
 import net.fabricmc.fabric.api.client.rendering.v1.hud.HudElement;
@@ -25,16 +23,7 @@ import net.minecraft.world.phys.Vec3;
 
 import java.util.List;
 
-/**
- * Помогает наводиться на цель внутри FOV-круга вокруг прицела.
- *
- * <p>Режим пока один — FOV: если цель попадает в конус с углом {@code FOV} и
- * в пределах {@code Range}, модуль каждый тик доводит yaw/pitch к ней
- * на долю {@code Speed}. Круг на экране — визуальный радиус того же угла.</p>
- *
- * <p>Фильтр целей совпадает с {@link TriggerBot}: Players / Animals / Mobs /
- * Naked / Friends. Приручённые животные и сам игрок никогда не целятся.</p>
- */
+/** Smooth, frame-rate-independent aim assistance inside the configured FOV. */
 public class AimAssist extends Module implements HudElement {
 
     private static final String MODE_FOV = "FOV";
@@ -49,9 +38,14 @@ public class AimAssist extends Module implements HudElement {
             EquipmentSlot.HEAD, EquipmentSlot.CHEST, EquipmentSlot.LEGS, EquipmentSlot.FEET
     };
 
-    /** Серый контур, непрозрачность ~90% (alpha 230). */
     private static final int CIRCLE_COLOR = 0xE6808080;
     private static final float CIRCLE_THICKNESS = 2.0F;
+
+    /** Prevents tiny corrections from alternating around the aim point. */
+    private static final float DEAD_ZONE_DEGREES = 0.06F;
+    /** A locked target gets a little extra room before the lock is released. */
+    private static final double LOCK_FOV_MULTIPLIER = 1.15;
+    private static final long MAX_FRAME_GAP_NANOS = 250_000_000L;
 
     private final SelectSetting mode = new SelectSetting("Mode", MODE_FOV, MODE_FOV);
     private final SliderSetting fov = new SliderSetting("FOV", 40.0, 10.0, 90.0, 1.0);
@@ -61,51 +55,90 @@ public class AimAssist extends Module implements HudElement {
             List.of(PLAYERS, ANIMALS, MOBS, NAKED, FRIENDS),
             PLAYERS, ANIMALS, MOBS, NAKED, FRIENDS);
 
+    private Entity lockedTarget;
+    private long previousAimNanos;
+
     public AimAssist() {
         super("AimAssist", "Helps aim at targets inside the FOV circle", Category.COMBAT);
         addSettings(mode, fov, speed, range, targets);
     }
 
-    @Subscribe(priority = Priority.HIGH)
-    private void onClientTick(ClientTickEvent event) {
-        if (event.getPhase() != ClientTickEvent.Phase.END) return;
-        if (!isEnabled() || mc.player == null || mc.level == null) return;
-        if (mc.screen != null || !mc.isWindowActive()) return;
-        if (mc.getCameraEntity() != mc.player || mc.player.isSleeping()) return;
+    @Override
+    protected void onEnable() {
+        resetAimState();
+    }
 
-        if (!mode.is(MODE_FOV)) return;
-
-        Entity target = findTarget();
-        if (target == null) return;
-
-        aimAt(target);
+    @Override
+    protected void onDisable() {
+        resetAimState();
     }
 
     /**
-     * Ближайшая (по угловому расстоянию до прицела) валидная цель
-     * в пределах range и FOV. Угол — между view-вектором и вектором к глазам цели.
+     * Runs with HUD rendering rather than the 20 Hz client tick. The target position
+     * is interpolated with the same partial tick used by world rendering, so moving
+     * targets no longer advance in visible tick-sized steps.
      */
-    private Entity findTarget() {
-        double maxRange = range.getValue();
-        double maxRangeSq = maxRange * maxRange;
-        double maxAngle = fov.getValue();
+    private void updateAim() {
+        if (!canAim()) {
+            resetAimState();
+            return;
+        }
 
-        Vec3 eyes = mc.player.getEyePosition(1.0F);
-        Vec3 look = mc.player.getViewVector(1.0F);
+        float partialTick = MathUtil.partialTick();
+        Entity target = selectTarget(partialTick);
+        if (target == null) {
+            previousAimNanos = 0L;
+            return;
+        }
 
+        long now = System.nanoTime();
+        double seconds = frameSeconds(now);
+        aimAt(target, partialTick, seconds);
+    }
+
+    private boolean canAim() {
+        return isEnabled()
+                && mc.player != null
+                && mc.level != null
+                && mc.screen == null
+                && mc.isWindowActive()
+                && mc.getCameraEntity() == mc.player
+                && !mc.player.isSleeping()
+                && mode.is(MODE_FOV);
+    }
+
+    private Entity selectTarget(float partialTick) {
+        if (isLockedTargetValid(lockedTarget, partialTick)) {
+            return lockedTarget;
+        }
+
+        lockedTarget = findTarget(partialTick);
+        return lockedTarget;
+    }
+
+    private boolean isLockedTargetValid(Entity entity, float partialTick) {
+        if (!isTargetAllowed(entity)) return false;
+        return isInsideAimArea(entity, partialTick, LOCK_FOV_MULTIPLIER);
+    }
+
+    /** Finds the entity closest to the crosshair, not merely the closest entity. */
+    private Entity findTarget(float partialTick) {
         Entity best = null;
         double bestAngle = Double.MAX_VALUE;
+
+        Vec3 eyes = mc.player.getEyePosition(partialTick);
+        Vec3 look = mc.player.getViewVector(partialTick);
+        double maxRangeSq = square(range.getValue());
+        double maxAngle = fov.getValue();
 
         for (Entity entity : mc.level.entitiesForRendering()) {
             if (!isTargetAllowed(entity)) continue;
 
-            Vec3 targetEyes = entity.getEyePosition(1.0F);
+            Vec3 targetEyes = entity.getEyePosition(partialTick);
             double distSq = eyes.distanceToSqr(targetEyes);
             if (distSq > maxRangeSq || distSq < 1.0E-4) continue;
 
-            Vec3 toTarget = targetEyes.subtract(eyes).normalize();
-            double dot = Mth.clamp(look.dot(toTarget), -1.0, 1.0);
-            double angle = Math.toDegrees(Math.acos(dot));
+            double angle = angleBetween(look, targetEyes.subtract(eyes));
             if (angle > maxAngle) continue;
 
             if (angle < bestAngle) {
@@ -116,13 +149,21 @@ public class AimAssist extends Module implements HudElement {
         return best;
     }
 
-    /**
-     * Доводит yaw/pitch к глазам цели. Speed 1..100 — процент коррекции за тик:
-     * 100 почти мгновенно, 30 — мягкая помощь.
-     */
-    private void aimAt(Entity target) {
-        Vec3 eyes = mc.player.getEyePosition(1.0F);
-        Vec3 targetEyes = target.getEyePosition(1.0F);
+    private boolean isInsideAimArea(Entity entity, float partialTick, double fovMultiplier) {
+        Vec3 eyes = mc.player.getEyePosition(partialTick);
+        Vec3 targetEyes = entity.getEyePosition(partialTick);
+        Vec3 delta = targetEyes.subtract(eyes);
+
+        double distanceSq = delta.lengthSqr();
+        if (distanceSq < 1.0E-4 || distanceSq > square(range.getValue())) return false;
+
+        double angle = angleBetween(mc.player.getViewVector(partialTick), delta);
+        return angle <= fov.getValue() * fovMultiplier;
+    }
+
+    private void aimAt(Entity target, float partialTick, double seconds) {
+        Vec3 eyes = mc.player.getEyePosition(partialTick);
+        Vec3 targetEyes = target.getEyePosition(partialTick);
         Vec3 delta = targetEyes.subtract(eyes);
 
         double distXZ = Math.sqrt(delta.x * delta.x + delta.z * delta.z);
@@ -131,15 +172,55 @@ public class AimAssist extends Module implements HudElement {
 
         float yaw = mc.player.getYRot();
         float pitch = mc.player.getXRot();
-
         float yawDiff = Mth.wrapDegrees(targetYaw - yaw);
         float pitchDiff = targetPitch - pitch;
 
-        float factor = (float) (speed.getValue() / 100.0);
-        factor = Mth.clamp(factor, 0.0F, 1.0F);
+        if (Math.abs(yawDiff) < DEAD_ZONE_DEGREES) yawDiff = 0.0F;
+        if (Math.abs(pitchDiff) < DEAD_ZONE_DEGREES) pitchDiff = 0.0F;
+        if (yawDiff == 0.0F && pitchDiff == 0.0F) return;
 
-        mc.player.setYRot(yaw + yawDiff * factor);
-        mc.player.setXRot(Mth.clamp(pitch + pitchDiff * factor, -90.0F, 90.0F));
+        float frameFactor = smoothingFactor(seconds);
+        mc.player.setYRot(yaw + yawDiff * frameFactor);
+        mc.player.setXRot(Mth.clamp(pitch + pitchDiff * frameFactor, -90.0F, 90.0F));
+    }
+
+    /**
+     * Preserves the old Speed meaning at 20 ticks per second, while making the
+     * correction independent of render FPS.
+     */
+    private float smoothingFactor(double seconds) {
+        double tickFactor = Mth.clamp(speed.getValue() / 100.0, 0.0, 1.0);
+        if (tickFactor >= 1.0) return 1.0F;
+
+        double frameFactor = 1.0 - Math.pow(1.0 - tickFactor, seconds * 20.0);
+        return (float) Mth.clamp(frameFactor, 0.0, 1.0);
+    }
+
+    private double frameSeconds(long nowNanos) {
+        double seconds = 1.0 / 60.0;
+        if (previousAimNanos != 0L) {
+            long elapsed = nowNanos - previousAimNanos;
+            if (elapsed >= 0L && elapsed <= MAX_FRAME_GAP_NANOS) {
+                seconds = elapsed / 1_000_000_000.0;
+            }
+        }
+        previousAimNanos = nowNanos;
+        return seconds;
+    }
+
+    private static double angleBetween(Vec3 look, Vec3 delta) {
+        Vec3 direction = delta.normalize();
+        double dot = Mth.clamp(look.dot(direction), -1.0, 1.0);
+        return Math.toDegrees(Math.acos(dot));
+    }
+
+    private static double square(double value) {
+        return value * value;
+    }
+
+    private void resetAimState() {
+        lockedTarget = null;
+        previousAimNanos = 0L;
     }
 
     private boolean isTargetAllowed(Entity entity) {
@@ -163,10 +244,10 @@ public class AimAssist extends Module implements HudElement {
         return false;
     }
 
-    // ---------------- HUD: FOV-круг ----------------
-
     @Override
     public void render(GuiGraphics graphics, DeltaTracker delta) {
+        updateAim();
+
         if (!isEnabled() || mc.player == null || mc.level == null) return;
         if (mc.screen != null || mc.options.hideGui) return;
         if (!mode.is(MODE_FOV)) return;
@@ -179,7 +260,6 @@ public class AimAssist extends Module implements HudElement {
         float radius = fovToPixels(fov.getValue().floatValue(), height);
         if (radius < 1.0F) return;
 
-        // Обводка круга: roundedOutline с radius = половина стороны даёт окружность.
         float diameter = radius * 2.0F;
         Render2D.roundedOutline(
                 graphics,
@@ -193,11 +273,6 @@ public class AimAssist extends Module implements HudElement {
         );
     }
 
-    /**
-     * Переводит угловой FOV (градусы) в радиус круга на экране.
-     * Использует текущий FOV опций, чтобы круг совпадал с конусом наводки
-     * при любом зуме/настройке камеры.
-     */
     private float fovToPixels(float aimFovDeg, float screenHeight) {
         double gameFov = mc.options.fov().get();
         if (gameFov <= 1.0) gameFov = 70.0;
