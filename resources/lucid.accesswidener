@@ -1,0 +1,23 @@
+accessWidener v2 named
+
+# Нужен Render2D, чтобы отправлять свои элементы в GUI-рендер и учитывать scissor
+accessible class net/minecraft/client/gui/GuiGraphics$ScissorStack
+accessible field net/minecraft/client/gui/GuiGraphics guiRenderState Lnet/minecraft/client/gui/render/state/GuiRenderState;
+accessible field net/minecraft/client/gui/GuiGraphics scissorStack Lnet/minecraft/client/gui/GuiGraphics$ScissorStack;
+
+# AltManager подменяет имя сессии на месте: final снимаем, токен и UUID не трогаем.
+# Клиент берёт имя именно из User.name, когда собирает ServerboundHelloPacket.
+accessible field net/minecraft/client/User name Ljava/lang/String;
+mutable field net/minecraft/client/User name Ljava/lang/String;
+
+# Нужен HUD-элементу Cooldowns: публичные методы ItemCooldowns отдают только долю
+# остатка (getCooldownPercent), а для «3.2s» нужны точные тики — endTime - tickCount.
+# Ключ в карте — группа кулдауна, поэтому без самой карты список не собрать.
+accessible class net/minecraft/world/item/ItemCooldowns$CooldownInstance
+accessible field net/minecraft/world/item/ItemCooldowns cooldowns Ljava/util/Map;
+accessible field net/minecraft/world/item/ItemCooldowns tickCount I
+
+# TapeMouse кликает через ванильный путь: эти методы вызывает и обычный бинд кнопки,
+# поэтому все ветки клика (сущность, блок, промах с missTime) работают без своей имитации.
+accessible method net/minecraft/client/Minecraft startAttack ()Z
+accessible method net/minecraft/client/Minecraft startUseItem ()V

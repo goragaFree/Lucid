@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "id": "lucid",
+  "version": "${version}",
+  "name": "Lucid",
+  "description": "Lucid Client",
+  "authors": [],
+  "contact": {},
+  "license": "All-Rights-Reserved",
+  "icon": "assets/lucid/icon.png",
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "dev.lucid.Lucid"
+    ]
+  },
+  "accessWidener": "lucid.accesswidener",
+  "mixins": [
+    "lucid.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=${loader_version}",
+    "fabric-api": "*",
+    "minecraft": "${minecraft_version}"
+  }
+}
